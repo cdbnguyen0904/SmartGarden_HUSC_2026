@@ -45,8 +45,7 @@ class _MyAppState extends State<MyApp> {
   // --- BIẾN TRẠNG THÁI ---
   double temp = 0.0;
   double humid = 0.0;
-  
-  // Biến vùng tưới thủ công (null nghĩa là đang tắt)
+  bool isMqttConnected = false;
   String? activeZone;
 
   // Biến hẹn giờ
@@ -96,26 +95,44 @@ class _MyAppState extends State<MyApp> {
   }
 
   void _setupMqtt() async {
-    await mqtt.connect(); 
-    mqtt.subscribe("weather", (message) {
-      if (message == "on2") {
-        _addLog("Hệ thống bơm đang hoạt động");
-      } else if (message == "off2") {
-        setState(() => activeZone = null);
-        _addLog("Bơm đã TẮT");
-      } else if (message.contains("|")) {
-        var parts = message.split("|");
-        if (parts.length >= 2) {
-          setState(() {
-            temp = double.tryParse(parts[0]) ?? temp;
-            humid = double.tryParse(parts[1]) ?? humid;
-            
-            chartData.add(ChartData(DateTime.now(), temp, humid));
-            if (chartData.length > 20) chartData.removeAt(0);
-          });
+    setState(() => isMqttConnected = false);
+    try {
+      await mqtt.connect(); 
+      setState(() => isMqttConnected = true);
+      
+      mqtt.subscribe("weather", (message) {
+        // 1. Nhận mã lệnh TẮT
+        if (message == "off" || message == "off2") { 
+          setState(() => activeZone = null);
+          _addLog("All devices turned OFF");
+        } 
+        // 2. Nhận mã lệnh BẬT cụ thể
+        else if (message.startsWith("on") && message.length == 3) {
+          String zoneReceived = message.substring(2); 
+          if (["0", "1", "2", "3", "4"].contains(zoneReceived)) {
+            setState(() => activeZone = zoneReceived);
+            String zoneName = zoneReceived == "0" ? "All Zones" : "Zone $zoneReceived";
+            _addLog("Hardware status: $zoneName is RUNNING");
+          }
+        } 
+        // 3. Nhận dữ liệu cảm biến
+        else if (message.contains("|")) {
+          var parts = message.split("|");
+          if (parts.length >= 2) {
+            setState(() {
+              temp = double.tryParse(parts[0]) ?? temp;
+              humid = double.tryParse(parts[1]) ?? humid;
+              
+              chartData.add(ChartData(DateTime.now(), temp, humid));
+              if (chartData.length > 20) chartData.removeAt(0);
+            });
+          }
         }
-      }
-    });
+      });
+    } catch (e) {
+      setState(() => isMqttConnected = false);
+      _addLog("MQTT Broker connection failed");
+    }
   }
 
   void _addLog(String log) {
@@ -135,17 +152,17 @@ class _MyAppState extends State<MyApp> {
     mqtt.publish("control", msg);
     
     if (isAuto) {
-      _addLog("Hẹn giờ: $timeStr ($wateringDuration phút)");
+      _addLog("Schedule enabled: $timeStr ($wateringDuration mins)");
     } else {
-      _addLog("Đã hủy hẹn giờ tự động");
+      _addLog("Schedule disabled");
     }
   }
 
   void _handleManual(String zone) {
     setState(() => activeZone = zone);
     mqtt.publish("control", zone);
-    String zoneName = zone == "0" ? "Tất cả vùng" : "Vùng $zone";
-    _addLog("Bật thủ công: $zoneName");
+    String zoneName = zone == "0" ? "All Zones" : "Zone $zone";
+    _addLog("Command sent: Turn ON $zoneName");
   }
 
   @override
@@ -165,6 +182,7 @@ class _MyAppState extends State<MyApp> {
             const SizedBox(width: 12),
             const Column(
               crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
               children: [
                 Text("Smart Garden", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18, color: Colors.green)),
                 Text("Trường ĐH Khoa học Huế", style: TextStyle(fontSize: 12, color: Colors.grey)),
@@ -178,46 +196,86 @@ class _MyAppState extends State<MyApp> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            // 1. Đồng hồ đo
+            // 1. Trạng thái MQTT kết nối
+            AnimatedContainer(
+              duration: const Duration(milliseconds: 300),
+              margin: const EdgeInsets.only(bottom: 16),
+              padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 16),
+              decoration: BoxDecoration(
+                color: isMqttConnected ? Colors.green.shade50 : Colors.red.shade50,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: isMqttConnected ? Colors.green : Colors.red, width: 1.2),
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    isMqttConnected ? Icons.cloud_done : Icons.cloud_off,
+                    color: isMqttConnected ? Colors.green : Colors.red,
+                    size: 20,
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      isMqttConnected ? "Broker Server: Connected" : "Broker Server: Disconnected (Retrying...)",
+                      style: TextStyle(
+                        color: isMqttConnected ? Colors.green.shade900 : Colors.red.shade900,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 14,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+
+            // 2. Đồng hồ đo Gauges
             Row(
               children: [
-                Expanded(child: _buildGauge("Nhiệt độ", temp, 50, Colors.redAccent, "°C", Icons.thermostat)),
+                Expanded(child: _buildGauge("Temperature", temp, 50, Colors.redAccent, "°C", Icons.thermostat)),
                 const SizedBox(width: 10),
-                Expanded(child: _buildGauge("Độ ẩm", humid, 100, Colors.blueAccent, "%", Icons.water_drop)),
+                Expanded(child: _buildGauge("Humidity", humid, 100, Colors.blueAccent, "%", Icons.water_drop)),
               ],
             ),
             const SizedBox(height: 16),
 
-            // 2. Biểu đồ thay đổi
+            // 3. Biểu đồ Spline Chart
             _buildChartSection(),
             const SizedBox(height: 16),
 
-            // 3. Điều khiển thủ công (Vùng tưới)
+            // 4. KIỂM SOÁT THỦ CÔNG (ĐÃ FIX CHỐNG TRÀN OVERFLOW HOÀN HẢO)
             _buildCard(
-              title: "Tưới thủ công ngay bây giờ",
+              title: "Manual Control",
               icon: Icons.touch_app,
               color: Colors.green,
-              child: Wrap(
-                spacing: 12, runSpacing: 12,
-                alignment: WrapAlignment.center,
+              child: GridView.count(
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                crossAxisCount: 2,
+                crossAxisSpacing: 12,
+                mainAxisSpacing: 12,
+                childAspectRatio: 2.0, // Chỉnh xuống 2.0 để tăng chiều cao an toàn cho nút bấm
                 children: [
-                  _buildZoneButton("1"), _buildZoneButton("2"),
-                  _buildZoneButton("3"), _buildZoneButton("4"),
-                  _buildZoneButton("0", isAll: true),
+                  _buildZoneButton("1"),
+                  _buildZoneButton("2"),
+                  _buildZoneButton("3"),
+                  _buildZoneButton("4"),
+                  _buildZoneButton("0"),   // Nút ALL ON
+                  _buildZoneButton("off"), // Nút ALL OFF (Kill Switch) màu đỏ
                 ],
               ),
             ),
             const SizedBox(height: 16),
 
-            // 4. Hẹn giờ tự động
+            // 5. Hẹn giờ tự động Auto Schedule
             _buildCard(
-              title: "Hẹn giờ tưới",
+              title: "Auto Schedule",
               icon: Icons.alarm,
               color: Colors.purple,
               child: Column(
+                mainAxisSize: MainAxisSize.min,
                 children: [
                   SwitchListTile(
-                    title: const Text("Kích hoạt tự động", style: TextStyle(fontWeight: FontWeight.w500)),
+                    title: const Text("Enable Automation", style: TextStyle(fontWeight: FontWeight.w500)),
                     value: isAuto,
                     activeThumbColor: Colors.purple,
                     onChanged: (val) {
@@ -226,9 +284,9 @@ class _MyAppState extends State<MyApp> {
                     },
                   ),
                   ListTile(
-                    title: const Text("Giờ bắt đầu tưới"),
+                    title: const Text("Start Time"),
                     trailing: Text(
-                      selectedTime?.format(context) ?? "Chưa chọn",
+                      selectedTime?.format(context) ?? "Not Set",
                       style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
                     ),
                     onTap: () async {
@@ -243,12 +301,13 @@ class _MyAppState extends State<MyApp> {
                     padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
                       children: [
-                        Text("Tưới trong: $wateringDuration phút", style: const TextStyle(fontWeight: FontWeight.w600)),
+                        Text("Duration: $wateringDuration mins", style: const TextStyle(fontWeight: FontWeight.w600)),
                         Slider(
                           value: wateringDuration.toDouble(),
                           min: 1, max: 30, divisions: 29,
-                          label: "$wateringDuration phút",
+                          label: "$wateringDuration mins",
                           activeColor: Colors.purple,
                           onChanged: (val) => setState(() => wateringDuration = val.toInt()),
                           onChangeEnd: (val) { if (isAuto) _sendAutoCommand(); },
@@ -257,7 +316,7 @@ class _MyAppState extends State<MyApp> {
                     ),
                   ),
                   SwitchListTile(
-                    title: const Text("Lặp lại hằng ngày"),
+                    title: const Text("Daily Repeat"),
                     value: isRepeat,
                     activeThumbColor: Colors.purple,
                     onChanged: (val) {
@@ -270,13 +329,18 @@ class _MyAppState extends State<MyApp> {
             ),
             const SizedBox(height: 16),
 
-            // 5. Nhật ký
+            // 6. NHẬT KÝ HOẠT ĐỘNG (100% TIẾNG ANH)
             _buildCard(
-              title: "Nhật ký chăm sóc",
+              title: "Activity Log",
               icon: Icons.history,
               color: Colors.teal,
               child: logs.isEmpty 
-                  ? const Center(child: Padding(padding: EdgeInsets.all(16), child: Text("Chưa có hoạt động", style: TextStyle(color: Colors.grey))))
+                  ? const Center(
+                      child: Padding(
+                        padding: EdgeInsets.all(16),
+                        child: Text("No activities recorded yet.", style: TextStyle(color: Colors.grey)),
+                      ),
+                    )
                   : ListView.builder(
                       shrinkWrap: true,
                       physics: const NeverScrollableScrollPhysics(),
@@ -295,36 +359,79 @@ class _MyAppState extends State<MyApp> {
     );
   }
 
-  // --- WIDGET COMPONENTS ---
+  // --- HÀM TẠO NÚT BẤM (ĐÃ BỌC FITTEDBOX & FLEXIBLE TUYỆT ĐỐI KHÔNG OVERFLOW) ---
+  Widget _buildZoneButton(String zone) {
+    bool isActive;
+    String label;
+    IconData icon;
+    Color activeColor;
 
-  Widget _buildZoneButton(String zone, {bool isAll = false}) {
-    bool isActive = activeZone == zone;
-    String label = isAll ? "TẤT CẢ VÙNG" : "VÙNG $zone";
+    if (zone == "off") {
+      isActive = (activeZone == null); 
+      label = "ALL OFF";
+      icon = Icons.power_settings_new;
+      activeColor = Colors.redAccent;
+    } else if (zone == "0") {
+      isActive = (activeZone == "0");
+      label = "ALL ON";
+      icon = Icons.bolt;
+      activeColor = Colors.blueAccent;
+    } else {
+      isActive = (activeZone == zone);
+      label = "ZONE $zone";
+      icon = Icons.water_drop;
+      activeColor = Colors.blueAccent;
+    }
+
     return InkWell(
       onTap: () {
-        if (isActive) {
+        if (zone == "off") {
           setState(() => activeZone = null);
           mqtt.publish("control", "off");
-          _addLog("Đã tắt máy bơm");
+          _addLog("Emergency stop activated: ALL OFF");
         } else {
-          _handleManual(zone);
+          if (isActive) {
+            setState(() => activeZone = null);
+            mqtt.publish("control", "off");
+            _addLog("Command sent: Turn OFF all zones");
+          } else {
+            _handleManual(zone);
+          }
         }
       },
       borderRadius: BorderRadius.circular(12),
       child: AnimatedContainer(
-        duration: const Duration(milliseconds: 300),
-        width: isAll ? double.infinity : (MediaQuery.of(context).size.width - 60) / 2,
-        padding: const EdgeInsets.symmetric(vertical: 16),
+        duration: const Duration(milliseconds: 250),
+        padding: const EdgeInsets.symmetric(vertical: 6), // Thu hẹp padding dọc tối ưu khoảng trống
         decoration: BoxDecoration(
-          color: isActive ? Colors.blueAccent : Colors.grey.shade100,
+          color: isActive ? activeColor : Colors.grey.shade100,
           borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: isActive ? Colors.blueAccent : Colors.grey.shade300),
+          border: Border.all(color: isActive ? activeColor : Colors.grey.shade300, width: 1.2),
         ),
         child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          mainAxisSize: MainAxisSize.min, // Ép Column co cụm theo nội dung
           children: [
-            Icon(isActive ? Icons.water_drop : Icons.water_drop_outlined, color: isActive ? Colors.white : Colors.blueGrey),
-            const SizedBox(height: 8),
-            Text(isActive ? "ĐANG TƯỚI..." : label, style: TextStyle(color: isActive ? Colors.white : Colors.black87, fontWeight: FontWeight.bold)),
+            Icon(
+              isActive ? icon : Icons.radio_button_unchecked, 
+              color: isActive ? Colors.white : Colors.blueGrey,
+              size: 20, // Giảm nhẹ size icon để lấy không gian cho Text
+            ),
+            const SizedBox(height: 4),
+            // Tấm khiên bảo vệ tối thượng: Giúp chữ tự thu nhỏ lại nếu màn hình Emulator quá hẹp
+            Flexible(
+              child: FittedBox(
+                fit: BoxFit.scaleDown,
+                child: Text(
+                  (isActive && zone != "off") ? "RUNNING..." : label, 
+                  style: TextStyle(
+                    color: isActive ? Colors.white : Colors.black87, 
+                    fontWeight: FontWeight.bold,
+                    fontSize: 13,
+                  ),
+                ),
+              ),
+            ),
           ],
         ),
       ),
@@ -340,6 +447,7 @@ class _MyAppState extends State<MyApp> {
         padding: const EdgeInsets.all(16.0),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
           children: [
             Row(
               children: [
@@ -349,6 +457,7 @@ class _MyAppState extends State<MyApp> {
               ],
             ),
             const Divider(),
+            const SizedBox(height: 4),
             child,
           ],
         ),
@@ -361,10 +470,21 @@ class _MyAppState extends State<MyApp> {
       padding: const EdgeInsets.all(8),
       decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(15), boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 4)]),
       child: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
           Row(
             mainAxisAlignment: MainAxisAlignment.center,
-            children: [Icon(icon, size: 16, color: Colors.grey), const SizedBox(width: 4), Text(title, style: const TextStyle(fontWeight: FontWeight.w600, color: Colors.grey))],
+            children: [
+              Icon(icon, size: 16, color: Colors.grey), 
+              const SizedBox(width: 4), 
+              Flexible(
+                child: Text(
+                  title, 
+                  style: const TextStyle(fontWeight: FontWeight.w600, color: Colors.grey),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
           ),
           SizedBox(
             height: 110,
@@ -400,12 +520,12 @@ class _MyAppState extends State<MyApp> {
         legend: Legend(isVisible: true, position: LegendPosition.top),
         series: <CartesianSeries>[
           SplineSeries<ChartData, DateTime>(
-            name: 'Nhiệt độ', dataSource: chartData,
+            name: 'Temperature', dataSource: chartData,
             xValueMapper: (ChartData data, _) => data.time, yValueMapper: (ChartData data, _) => data.temp,
             color: Colors.redAccent, width: 3,
           ),
           SplineSeries<ChartData, DateTime>(
-            name: 'Độ ẩm', dataSource: chartData,
+            name: 'Humidity', dataSource: chartData,
             xValueMapper: (ChartData data, _) => data.time, yValueMapper: (ChartData data, _) => data.humid,
             color: Colors.blueAccent, width: 3,
           ),
